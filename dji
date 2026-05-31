@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Copies common camera/drone media from mounted USB/MTP devices to ~/Videos.
+# Optional name mappings live in: ~/.config/copy-drone-media/device-names.conf
+
+DEST_BASE="${DEST_BASE:-$HOME/Videos}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/copy-drone-media"
+NAME_MAP="$CONFIG_DIR/device-names.conf"
+
+VIDEO_FIND_EXPR=(-iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.insv' -o -iname '*.lrv')
+IMAGE_FIND_EXPR=(-iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.dng' -o -iname '*.heic')
+MEDIA_FIND_EXPR=("${VIDEO_FIND_EXPR[@]}" -o "${IMAGE_FIND_EXPR[@]}")
+
+mkdir -p "$DEST_BASE" "$CONFIG_DIR"
+
+if [[ ! -f "$NAME_MAP" ]]; then
+  cat > "$NAME_MAP" <<'EOF'
+# Optional friendly device names.
+# Format: search text = folder name
+# The search text is matched against mount name, USB label/model/vendor, and a few file paths.
+#
+# Examples:
+# InternalSto = dji
+# File-Stor Gadget = dji
+# Action = Action 5 Pro
+EOF
+fi
+
+if ! grep -Eq '^[[:space:]]*(InternalSto|File-Stor Gadget)[[:space:]]*=' "$NAME_MAP"; then
+  {
+    printf '\n'
+    printf 'InternalSto = dji\n'
+    printf 'File-Stor Gadget = dji\n'
+  } >> "$NAME_MAP"
+fi
+
+sanitize_name() {
+  local name="$1"
+  name="${name//\//-}"
+  name="${name//:/-}"
+  name="${name//\\/ - }"
+  name="$(printf '%s' "$name" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  [[ -n "$name" ]] && printf '%s\n' "$name" || printf 'Camera\n'
+}
+
+metadata_for_mount() {
+  local mountpoint="$1"
+  local source metadata
+  source="$(findmnt -rn --target "$mountpoint" -o SOURCE 2>/dev/null | head -n 1 || true)"
+  metadata="$(basename "$mountpoint") $mountpoint"
+
+  if [[ -n "$source" && "$source" == /dev/* ]]; then
+    metadata+=" $(lsblk -P -no LABEL,MODEL,VENDOR "$source" 2>/dev/null || true)"
+  fi
+
+  metadata+=" $(find "$mountpoint" -maxdepth 3 -type f 2>/dev/null | head -n 10 | tr '\n' ' ')"
+  printf '%s\n' "$metadata"
+}
+
+friendly_name_for_mount() {
+  local mountpoint="$1"
+  local metadata pattern name base
+  metadata="$(metadata_for_mount "$mountpoint")"
+
+  while IFS='=' read -r pattern name; do
+    pattern="$(printf '%s' "${pattern:-}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    name="$(printf '%s' "${name:-}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$pattern" || "$pattern" == \#* || -z "$name" ]] && continue
+    if printf '%s' "$metadata" | grep -Fqi -- "$pattern"; then
+      sanitize_name "$name"
+      return
+    fi
+  done < "$NAME_MAP"
+
+  base="$(basename "$mountpoint")"
+  if printf '%s' "$metadata" | grep -Eqi 'DJI_|/DCIM/DJI|dji'; then
+    sanitize_name "dji"
+  elif printf '%s' "$metadata" | grep -Eqi 'osmo|action'; then
+    sanitize_name "action"
+  elif [[ "$base" != "InternalSto" && "$base" != "Untitled" && "$base" != "NO NAME" ]]; then
+    sanitize_name "$base"
+  else
+    sanitize_name "camera"
+  fi
+}
+
+human_size() {
+  local bytes="$1"
+  numfmt --to=iec --suffix=B --format='%.2f' "$bytes" 2>/dev/null || printf '%s B' "$bytes"
+}
+
+is_video_path() {
+  case "${1,,}" in
+    *.mp4|*.mov|*.m4v|*.insv|*.lrv) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_image_path() {
+  case "${1,,}" in
+    *.jpg|*.jpeg|*.png|*.dng|*.heic) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+build_media_lists() {
+  local source="$1" all_list="$2" video_list="$3" image_list="$4"
+  local absolute relative
+
+  : > "$all_list"
+  : > "$video_list"
+  : > "$image_list"
+
+  while IFS= read -r -d '' absolute; do
+    relative="${absolute#"$source"/}"
+    printf '%s\0' "$relative" >> "$all_list"
+    if is_video_path "$relative"; then
+      printf '%s\0' "$relative" >> "$video_list"
+    elif is_image_path "$relative"; then
+      printf '%s\0' "$relative" >> "$image_list"
+    fi
+  done < <(find "$source" -type f \( "${MEDIA_FIND_EXPR[@]}" \) -print0)
+}
+
+count_list() {
+  tr -cd '\0' < "$1" | wc -c
+}
+
+sum_list_bytes() {
+  local source="$1" list="$2"
+  local total=0 relative size
+
+  while IFS= read -r -d '' relative; do
+    size="$(stat -c '%s' "$source/$relative" 2>/dev/null || printf '0')"
+    total=$((total + size))
+  done < "$list"
+
+  printf '%s\n' "$total"
+}
+
+copy_category() {
+  local source="$1" list="$2" target="$3" label="$4" count="$5" total_bytes="$6"
+  local index=0 copied_bytes=0 percent relative filename destination base ext stem size
+
+  [[ "$count" -gt 0 ]] || return 0
+
+  mkdir -p "$target"
+  printf '\nKopiere %s (%s Dateien, %s) ...\n' "$label" "$count" "$(human_size "$total_bytes")"
+
+  while IFS= read -r -d '' relative; do
+    index=$((index + 1))
+    filename="$(basename "$relative")"
+    destination="$target/$filename"
+
+    if [[ -e "$destination" ]]; then
+      ext=""
+      stem="$filename"
+      if [[ "$filename" == *.* ]]; then
+        ext=".${filename##*.}"
+        stem="${filename%.*}"
+      fi
+
+      base=2
+      while [[ -e "$target/${stem}_$base$ext" ]]; do
+        base=$((base + 1))
+      done
+      destination="$target/${stem}_$base$ext"
+    fi
+
+    size="$(stat -c '%s' "$source/$relative" 2>/dev/null || printf '0')"
+    if [[ "$total_bytes" -gt 0 ]]; then
+      percent=$((copied_bytes * 100 / total_bytes))
+    else
+      percent=0
+    fi
+
+    printf '\n[%s/%s | %s%% | %s von %s] %s\n' \
+      "$index" "$count" "$percent" "$(human_size "$copied_bytes")" "$(human_size "$total_bytes")" "$filename"
+
+    rsync -a --human-readable --info=progress2 "$source/$relative" "$destination"
+    copied_bytes=$((copied_bytes + size))
+
+    if [[ "$total_bytes" -gt 0 ]]; then
+      percent=$((copied_bytes * 100 / total_bytes))
+    else
+      percent=100
+    fi
+    printf '[%s/%s | %s%% | %s von %s] fertig\n' \
+      "$index" "$count" "$percent" "$(human_size "$copied_bytes")" "$(human_size "$total_bytes")"
+  done < "$list"
+}
+
+collect_mounts() {
+  local uid
+  uid="$(id -u)"
+
+  for root in "/run/media/$USER" "/media/$USER" "/run/user/$uid/gvfs"; do
+    [[ -d "$root" ]] || continue
+    find "$root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null
+  done
+}
+
+copy_from_mount() {
+  local source="$1"
+  local device_name timestamp target all_list video_list image_list
+  local video_count image_count total_count video_bytes image_bytes total_bytes
+
+  device_name="$(friendly_name_for_mount "$source")"
+  timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
+  target="$DEST_BASE/$device_name $timestamp"
+  all_list="$(mktemp)"
+  video_list="$(mktemp)"
+  image_list="$(mktemp)"
+
+  build_media_lists "$source" "$all_list" "$video_list" "$image_list"
+  video_count="$(count_list "$video_list")"
+  image_count="$(count_list "$image_list")"
+  total_count="$(count_list "$all_list")"
+
+  if [[ "$total_count" -eq 0 ]]; then
+    rm -f "$all_list" "$video_list" "$image_list"
+    return 1
+  fi
+
+  video_bytes="$(sum_list_bytes "$source" "$video_list")"
+  image_bytes="$(sum_list_bytes "$source" "$image_list")"
+  total_bytes=$((video_bytes + image_bytes))
+
+  printf '\nQuelle: %s\n' "$source"
+  printf 'Ziel:   %s\n' "$target"
+  printf 'Status: %s Dateien gesamt, %s\n' "$total_count" "$(human_size "$total_bytes")"
+  printf '        Videos: %s Dateien, %s\n' "$video_count" "$(human_size "$video_bytes")"
+  printf '        Bilder: %s Dateien, %s\n' "$image_count" "$(human_size "$image_bytes")"
+
+  mkdir -p "$target"
+  copy_category "$source" "$video_list" "$target/Videos" "Videos" "$video_count" "$video_bytes"
+  copy_category "$source" "$image_list" "$target/Bilder" "Bilder" "$image_count" "$image_bytes"
+  rm -f "$all_list" "$video_list" "$image_list"
+
+  printf '\nFertig: %s Dateien (%s) kopiert nach:\n%s\n' "$total_count" "$(human_size "$total_bytes")" "$target"
+  return 0
+}
+
+main() {
+  local found=0 copied=0 mountpoint
+
+  while IFS= read -r mountpoint; do
+    [[ -d "$mountpoint" ]] || continue
+    found=1
+    printf '\nPruefe: %s\n' "$mountpoint"
+    if copy_from_mount "$mountpoint"; then
+      copied=1
+    else
+      printf 'Keine passenden Medien gefunden.\n'
+    fi
+  done < <(collect_mounts)
+
+  if [[ "$found" -eq 0 ]]; then
+    printf 'Keine USB-/Kamera-Mounts gefunden. Ist die Drohne im Dateiuebertragungsmodus verbunden?\n' >&2
+    exit 1
+  fi
+
+  if [[ "$copied" -eq 0 ]]; then
+    printf 'Es wurden keine Medien kopiert.\n' >&2
+    exit 2
+  fi
+}
+
+main "$@"
