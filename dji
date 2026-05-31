@@ -90,6 +90,52 @@ human_size() {
   numfmt --to=iec --suffix=B --format='%.2f' "$bytes" 2>/dev/null || printf '%s B' "$bytes"
 }
 
+month_name() {
+  case "$1" in
+    01) printf 'Januar' ;;
+    02) printf 'Februar' ;;
+    03) printf 'Maerz' ;;
+    04) printf 'April' ;;
+    05) printf 'Mai' ;;
+    06) printf 'Juni' ;;
+    07) printf 'Juli' ;;
+    08) printf 'August' ;;
+    09) printf 'September' ;;
+    10) printf 'Oktober' ;;
+    11) printf 'November' ;;
+    12) printf 'Dezember' ;;
+    *) printf 'Unbekannt' ;;
+  esac
+}
+
+device_folder_prefix() {
+  local device_name="$1"
+  case "${device_name,,}" in
+    dji*) printf 'DJI' ;;
+    action*|osmo*) printf 'Action' ;;
+    *) printf '%s' "$device_name" ;;
+  esac
+}
+
+recording_date_parts() {
+  local source_path="$1"
+  local filename year month day epoch
+  filename="$(basename "$source_path")"
+
+  if [[ "$filename" =~ (20[0-9]{2})([01][0-9])([0-3][0-9]) ]]; then
+    year="${BASH_REMATCH[1]}"
+    month="${BASH_REMATCH[2]}"
+    day="${BASH_REMATCH[3]}"
+  else
+    epoch="$(stat -c '%Y' "$source_path")"
+    year="$(date -d "@$epoch" '+%Y')"
+    month="$(date -d "@$epoch" '+%m')"
+    day="$(date -d "@$epoch" '+%d')"
+  fi
+
+  printf '%s|%s|%s\n' "${year:2:2}" "$(month_name "$month")" "$((10#$day))"
+}
+
 is_video_path() {
   case "${1,,}" in
     *.mp4|*.mov|*.m4v|*.insv|*.lrv) return 0 ;;
@@ -139,21 +185,56 @@ sum_list_bytes() {
   printf '%s\n' "$total"
 }
 
-copy_category() {
-  local source="$1" list="$2" target="$3" label="$4" count="$5" total_bytes="$6"
-  local index=0 copied_bytes=0 percent relative filename destination base ext stem size
+copy_media_files() {
+  local source="$1" list="$2" device_name="$3" total_count="$4" total_bytes="$5"
+  local device_prefix index=0 processed_bytes=0 copied_count=0 skipped_count=0 conflict_count=0
+  local copied_bytes=0 skipped_bytes=0 conflict_bytes=0
+  local relative source_path filename category date_parts yy month day target destination
+  local ext stem suffix size existing_size percent
 
-  [[ "$count" -gt 0 ]] || return 0
+  device_prefix="$(device_folder_prefix "$device_name")"
 
-  mkdir -p "$target"
-  printf '\nKopiere %s (%s Dateien, %s) ...\n' "$label" "$count" "$(human_size "$total_bytes")"
+  printf '\nImportiere Medien nach Aufnahmedatum ...\n'
 
   while IFS= read -r -d '' relative; do
     index=$((index + 1))
+    source_path="$source/$relative"
     filename="$(basename "$relative")"
+    size="$(stat -c '%s' "$source_path" 2>/dev/null || printf '0')"
+
+    if is_video_path "$relative"; then
+      category="Videos"
+    else
+      category="Bilder"
+    fi
+
+    date_parts="$(recording_date_parts "$source_path")"
+    IFS='|' read -r yy month day <<< "$date_parts"
+    target="$DEST_BASE/$device_prefix $yy/$month/$day/$category"
     destination="$target/$filename"
 
+    if [[ "$total_bytes" -gt 0 ]]; then
+      percent=$((processed_bytes * 100 / total_bytes))
+    else
+      percent=0
+    fi
+
+    printf '\n[%s/%s | %s%% | %s von %s] %s -> %s %s/%s/%s\n' \
+      "$index" "$total_count" "$percent" "$(human_size "$processed_bytes")" "$(human_size "$total_bytes")" \
+      "$filename" "$device_prefix" "$yy" "$month" "$day"
+
+    mkdir -p "$target"
+
     if [[ -e "$destination" ]]; then
+      existing_size="$(stat -c '%s' "$destination" 2>/dev/null || printf '-1')"
+      if [[ "$existing_size" == "$size" ]]; then
+        skipped_count=$((skipped_count + 1))
+        skipped_bytes=$((skipped_bytes + size))
+        processed_bytes=$((processed_bytes + size))
+        printf 'Schon vorhanden, gleiche Groesse: uebersprungen\n'
+        continue
+      fi
+
       ext=""
       stem="$filename"
       if [[ "$filename" == *.* ]]; then
@@ -161,34 +242,36 @@ copy_category() {
         stem="${filename%.*}"
       fi
 
-      base=2
-      while [[ -e "$target/${stem}_$base$ext" ]]; do
-        base=$((base + 1))
+      suffix=1
+      while [[ -e "$target/${stem}_konflikt_$suffix$ext" ]]; do
+        suffix=$((suffix + 1))
       done
-      destination="$target/${stem}_$base$ext"
+      destination="$target/${stem}_konflikt_$suffix$ext"
+      conflict_count=$((conflict_count + 1))
+      conflict_bytes=$((conflict_bytes + size))
+      printf 'Namenskonflikt mit anderer Groesse, kopiere als: %s\n' "$(basename "$destination")"
     fi
 
-    size="$(stat -c '%s' "$source/$relative" 2>/dev/null || printf '0')"
-    if [[ "$total_bytes" -gt 0 ]]; then
-      percent=$((copied_bytes * 100 / total_bytes))
-    else
-      percent=0
-    fi
+    rsync -a --human-readable --info=progress2 "$source_path" "$destination"
 
-    printf '\n[%s/%s | %s%% | %s von %s] %s\n' \
-      "$index" "$count" "$percent" "$(human_size "$copied_bytes")" "$(human_size "$total_bytes")" "$filename"
-
-    rsync -a --human-readable --info=progress2 "$source/$relative" "$destination"
+    copied_count=$((copied_count + 1))
     copied_bytes=$((copied_bytes + size))
+    processed_bytes=$((processed_bytes + size))
 
     if [[ "$total_bytes" -gt 0 ]]; then
-      percent=$((copied_bytes * 100 / total_bytes))
+      percent=$((processed_bytes * 100 / total_bytes))
     else
       percent=100
     fi
     printf '[%s/%s | %s%% | %s von %s] fertig\n' \
-      "$index" "$count" "$percent" "$(human_size "$copied_bytes")" "$(human_size "$total_bytes")"
+      "$index" "$total_count" "$percent" "$(human_size "$processed_bytes")" "$(human_size "$total_bytes")"
   done < "$list"
+
+  printf '\nZusammenfassung:\n'
+  printf '  Gefunden:       %s Dateien, %s\n' "$total_count" "$(human_size "$total_bytes")"
+  printf '  Neu kopiert:    %s Dateien, %s\n' "$copied_count" "$(human_size "$copied_bytes")"
+  printf '  Uebersprungen:  %s Dateien, %s\n' "$skipped_count" "$(human_size "$skipped_bytes")"
+  printf '  Konflikte:      %s Dateien, %s\n' "$conflict_count" "$(human_size "$conflict_bytes")"
 }
 
 collect_mounts() {
@@ -203,12 +286,10 @@ collect_mounts() {
 
 copy_from_mount() {
   local source="$1"
-  local device_name timestamp target all_list video_list image_list
+  local device_name all_list video_list image_list
   local video_count image_count total_count video_bytes image_bytes total_bytes
 
   device_name="$(friendly_name_for_mount "$source")"
-  timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
-  target="$DEST_BASE/$device_name $timestamp"
   all_list="$(mktemp)"
   video_list="$(mktemp)"
   image_list="$(mktemp)"
@@ -228,17 +309,15 @@ copy_from_mount() {
   total_bytes=$((video_bytes + image_bytes))
 
   printf '\nQuelle: %s\n' "$source"
-  printf 'Ziel:   %s\n' "$target"
+  printf 'Ziel:   %s/%s YY/Monat/Tag/{Videos,Bilder}\n' "$DEST_BASE" "$(device_folder_prefix "$device_name")"
   printf 'Status: %s Dateien gesamt, %s\n' "$total_count" "$(human_size "$total_bytes")"
   printf '        Videos: %s Dateien, %s\n' "$video_count" "$(human_size "$video_bytes")"
   printf '        Bilder: %s Dateien, %s\n' "$image_count" "$(human_size "$image_bytes")"
 
-  mkdir -p "$target"
-  copy_category "$source" "$video_list" "$target/Videos" "Videos" "$video_count" "$video_bytes"
-  copy_category "$source" "$image_list" "$target/Bilder" "Bilder" "$image_count" "$image_bytes"
+  copy_media_files "$source" "$all_list" "$device_name" "$total_count" "$total_bytes"
   rm -f "$all_list" "$video_list" "$image_list"
 
-  printf '\nFertig: %s Dateien (%s) kopiert nach:\n%s\n' "$total_count" "$(human_size "$total_bytes")" "$target"
+  printf '\nFertig.\n'
   return 0
 }
 
@@ -267,4 +346,6 @@ main() {
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -23,25 +23,37 @@ Vor dem Kopieren zeigt es:
 - Anzahl und Groesse der Bilder
 - Zielordner
 - laufenden Fortschritt inklusive aktueller Kopiergeschwindigkeit
+- wie viele Dateien neu kopiert, uebersprungen oder wegen Namenskonflikt separat abgelegt wurden
 
 ## Zielstruktur
 
-Bei jedem Lauf wird ein neuer Ordner mit Zeitstempel erstellt:
+Die Dateien werden nach Aufnahmedatum einsortiert. Das Datum wird zuerst aus dem Dateinamen gelesen, z.B. `DJI_20260530203106_0001_D.MP4`. Wenn kein Datum im Namen gefunden wird, nutzt das Script den Datei-Zeitstempel.
 
 ```text
 ~/Videos/
-└── dji 2026-05-31_10-10-00/
-    ├── Videos/
-    │   ├── DJI_20260529190348_0001_D.MP4
-    │   └── DJI_20260530094240_0002_D.MP4
-    └── Bilder/
-        ├── DJI_20260530203106_0010_D.JPG
-        └── DJI_20260530203111_0011_D.JPG
+├── DJI 26/
+│   └── Mai/
+│       └── 30/
+│           ├── Videos/
+│           │   ├── DJI_20260529190348_0001_D.MP4
+│           │   └── DJI_20260530094240_0002_D.MP4
+│           └── Bilder/
+│               ├── DJI_20260530203106_0010_D.JPG
+│               └── DJI_20260530203111_0011_D.JPG
+└── Action 26/
+    └── Mai/
+        └── 30/
+            ├── Videos/
+            └── Bilder/
 ```
 
 Kamera-Unterordner wie `DCIM/DJI_001` werden nicht uebernommen. Dateien landen direkt in `Videos/` oder `Bilder/`.
 
-Falls zwei Dateien denselben Namen haben, wird automatisch ein Suffix wie `_2` angehaengt, damit nichts ueberschrieben wird.
+Du kannst `dji` mehrfach ausfuehren:
+
+- vorhandene Datei mit gleichem Namen und gleicher Groesse: wird uebersprungen
+- gleicher Name, aber andere Groesse: wird als `_konflikt_1`, `_konflikt_2` usw. kopiert
+- neue Datei vom selben Aufnahmetag: wird in den bestehenden Tagesordner ergaenzt
 
 ## Unterstuetzte Dateitypen
 
